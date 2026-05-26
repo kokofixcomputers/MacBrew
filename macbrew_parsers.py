@@ -23,7 +23,9 @@ CASK_SHA256_INTEL_PATTERN = re.compile(r'sha256\s+intel:\s+"([a-f0-9]{64})"')
 CASK_FIELD_PATTERN = re.compile(r'^({})\s+"([^"]+)"'.format("|".join(["desc", "homepage"])), re.MULTILINE)
 CASK_NAME_PATTERN = re.compile(r'^\s*name\s+"([^"]+)"', re.MULTILINE)
 CASK_APP_PATTERN = re.compile(r'^\s*app\s+"([^"]+)"', re.MULTILINE)
+CASK_PKG_PATTERN = re.compile(r'^\s*pkg\s+"([^"]+)"', re.MULTILINE)
 CASK_ZAP_PATTERN = re.compile(r'zap\s+trash:\s+\[(.*?)\]', re.DOTALL)
+CASK_UNINSTALL_PKGUTIL_PATTERN = re.compile(r'pkgutil:\s*"([^"]+)"')
 CASK_CONFLICT_PATTERN = re.compile(r'conflicts_with\s+cask:\s+"([^"]+)"')
 CASK_DEPENDS_MACOS_PATTERN = re.compile(r'depends_on\s+macos:\s+"([^"]+)"')
 CASK_DEPENDS_MACOS_FLAG_PATTERN = re.compile(r'depends_on\s+:macos')
@@ -231,12 +233,17 @@ def parse_cask_rb(rb: str, arch_token: str) -> Dict[str, Any]:
     apps = []
     for m in CASK_APP_PATTERN.finditer(rb):
         apps.append({"app": [m.group(1)]})
+    for m in CASK_PKG_PATTERN.finditer(rb):
+        apps.append({"pkg": [m.group(1)]})
     out["artifacts"] = apps
     zap_block = CASK_ZAP_PATTERN.search(rb)
     if zap_block:
         paths = re.findall(r'"([^"]+)"', zap_block.group(1))
         if paths:
             out.setdefault("artifacts", []).append({"zap": [{"trash": paths}]})
+    uninstall_pkgutil = CASK_UNINSTALL_PKGUTIL_PATTERN.search(rb)
+    if uninstall_pkgutil:
+        out["uninstall"] = {"pkgutil": uninstall_pkgutil.group(1)}
     conflicts = CASK_CONFLICT_PATTERN.findall(rb)
     if conflicts:
         out["conflicts_with"] = {"cask": conflicts}

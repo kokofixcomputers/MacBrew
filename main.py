@@ -245,6 +245,8 @@ class Macbrew:
                 return self._fetch_sparkle_livecheck_version(livecheck)
             elif strategy == "regex":
                 return self._fetch_regex_livecheck_version(livecheck)
+            elif strategy == "header_match":
+                return self._fetch_header_match_livecheck_version(livecheck)
         except Exception:
             pass
         
@@ -300,6 +302,34 @@ class Macbrew:
             return None
         except Exception:
             return None
+
+    def _fetch_header_match_livecheck_version(self, livecheck: Dict[str, Any]) -> Optional[str]:
+        """Fetch version by examining redirect/location headers."""
+        try:
+            with httpx.Client(headers={"User-Agent": f"{APP_NAME}/0.1"}, timeout=TIMEOUT, follow_redirects=False) as client:
+                response = client.head(livecheck["url"])
+                if 300 <= response.status_code < 400:
+                    location = response.headers.get("location") or response.headers.get("Location")
+                    if location:
+                        return self._extract_version_from_text(location)
+                # Fall back to final URL if no redirect header was present
+                location = str(response.url)
+                version = self._extract_version_from_text(location)
+                if version:
+                    return version
+                # If HEAD didn't provide a useful result, try a GET without following redirects
+                response = client.get(livecheck["url"])
+                if 300 <= response.status_code < 400:
+                    location = response.headers.get("location") or response.headers.get("Location")
+                    if location:
+                        return self._extract_version_from_text(location)
+                return self._extract_version_from_text(str(response.url))
+        except Exception:
+            return None
+
+    def _extract_version_from_text(self, text: str) -> Optional[str]:
+        m = re.search(r'v?(\d+(?:\.\d+)+)', text)
+        return m.group(1) if m else None
 
     def _fetch_regex_livecheck_version(self, livecheck: Dict[str, Any]) -> Optional[str]:
         """Fetch version by applying regex to page content"""
@@ -911,176 +941,233 @@ class Macbrew:
         cask = self._select_cask_payload(self.detail("cask", token))
         artifacts = cask.get("artifacts", []) or []
         app_artifact = next((a for a in artifacts if "app" in a), None)
-        if not app_artifact:
-            raise MacbrewError("Only app-style casks are currently supported by this installer.")
+        pkg_artifact = next((a for a in artifacts if "pkg" in a), None)
+        if not app_artifact and not pkg_artifact:
+            raise MacbrewError("Only app-style and pkg-style casks are currently supported by this installer.")
 
-        app_name = app_artifact["app"][0] if isinstance(app_artifact["app"], list) else app_artifact["app"]
-        default_target = app_artifact.get("target") or str(Path(self.config.get("install_root", "/Applications")) / app_name)
-        install_dir = self.choose_install_root(default_target=str(self._cask_target_dir(default_target)))
-        target_path = expand_path(app_artifact.get("target") or str(install_dir / app_name))
-        if target_path.exists() and not inquirer.confirm(message="Overwrite existing app?", default=False, qmark="⚠️").execute():
-            return []
+        if app_artifact:
+            app_name = app_artifact["app"][0] if isinstance(app_artifact["app"], list) else app_artifact["app"]
+            default_target = app_artifact.get("target") or str(Path(self.config.get("install_root", "/Applications")) / app_name)
+            install_dir = self.choose_install_root(default_target=str(self._cask_target_dir(default_target)))
+            target_path = expand_path(app_artifact.get("target") or str(install_dir / app_name))
+            if target_path.exists() and not inquirer.confirm(message="Overwrite existing app?", default=False, qmark="⚠️").execute():
+                return []
 
-        downloaded = self._download_file(cask["url"], cask.get("sha256"))
-        mount_root = extracted_root = None
-        try:
-            if downloaded.suffix.lower() == ".dmg":
-                source_root = self._mount_dmg(downloaded)
-                mount_root = source_root
-            else:
-                source_root = self._extract_if_needed(downloaded)
-                extracted_root = source_root
+            downloaded = self._download_file(cask["url"], cask.get("sha256"))
+            mount_root = extracted_root = None
+            try:
+                if downloaded.suffix.lower() == ".dmg":
+                    source_root = self._mount_dmg(downloaded)
+                    mount_root = source_root
+                else:
+                    source_root = self._extract_if_needed(downloaded)
+                    extracted_root = source_root
 
-                # If extraction returned the parent directory (common when file has no known suffix),
-                # try to detect archive content and extract, or attempt to mount as a dmg.
-                if source_root.is_file() or (source_root.exists() and len(list(source_root.iterdir())) == 1 and list(source_root.iterdir())[0] == downloaded):
-                    # Try zip
+                    if source_root.is_file() or (source_root.exists() and len(list(source_root.iterdir())) == 1 and list(source_root.iterdir())[0] == downloaded):
+                        try:
+                            if zipfile.is_zipfile(downloaded):
+                                out = Path(tempfile.mkdtemp(prefix="macbrew-unzip-"))
+                                with zipfile.ZipFile(downloaded) as zf:
+                                    zf.extractall(out)
+                                source_root = out
+                                extracted_root = out
+                            elif tarfile.is_tarfile(downloaded):
+                                out = Path(tempfile.mkdtemp(prefix="macbrew-untar-"))
+                                with tarfile.open(downloaded) as tf:
+                                    tf.extractall(out)
+                                source_root = out
+                                extracted_root = out
+                            else:
+                                try:
+                                    mount_try = self._mount_dmg(downloaded)
+                                    source_root = mount_try
+                                    mount_root = mount_try
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+
+                base_name = app_name[:-4] if app_name.lower().endswith(".app") else app_name
+                candidates = list(source_root.rglob(app_name))
+                if not candidates and not app_name.lower().endswith(".app"):
+                    candidates = list(source_root.rglob(f"{app_name}.app"))
+
+                app_source = None
+                if candidates:
+                    app_source = candidates[0]
+                else:
+                    all_apps = [p for p in source_root.rglob("*") if p.name.lower().endswith(".app")]
+                    if all_apps:
+                        matches = [p for p in all_apps if base_name and base_name.lower() in p.name.lower()]
+                        app_source = matches[0] if matches else all_apps[0]
+
+                if not app_source:
+                    if downloaded.exists() and downloaded.name.lower().endswith(".app"):
+                        app_source = downloaded
+                    elif downloaded.is_dir():
+                        apps_in_download = [p for p in downloaded.rglob("*") if p.name.lower().endswith(".app")]
+                        if apps_in_download:
+                            app_source = apps_in_download[0]
+
+                if not app_source:
+                    parent_apps = [p for p in downloaded.parent.rglob("*") if p.name.lower().endswith(".app")]
+                    if parent_apps:
+                        app_source = parent_apps[0]
+
+                if not app_source or not app_source.exists():
                     try:
-                        if zipfile.is_zipfile(downloaded):
-                            out = Path(tempfile.mkdtemp(prefix="macbrew-unzip-"))
-                            with zipfile.ZipFile(downloaded) as zf:
-                                zf.extractall(out)
-                            source_root = out
-                            extracted_root = out
-                        elif tarfile.is_tarfile(downloaded):
-                            out = Path(tempfile.mkdtemp(prefix="macbrew-untar-"))
-                            with tarfile.open(downloaded) as tf:
-                                tf.extractall(out)
-                            source_root = out
-                            extracted_root = out
-                        else:
-                            # As a last resort, try mounting the file as a dmg (hdiutil can often mount raw images)
-                            try:
-                                mount_try = self._mount_dmg(downloaded)
-                                source_root = mount_try
-                                mount_root = mount_try
-                            except Exception:
-                                pass
-                    except Exception:
-                        # ignore extraction errors and continue with original source_root
-                        pass
-
-            # Try several strategies to locate the app bundle inside the installer media.
-            # Normalize base name without the .app suffix for fuzzy matching.
-            base_name = app_name[:-4] if app_name.lower().endswith(".app") else app_name
-
-            # 1) Exact matches (allow both with and without .app)
-            candidates = list(source_root.rglob(app_name))
-            if not candidates and not app_name.lower().endswith(".app"):
-                candidates = list(source_root.rglob(f"{app_name}.app"))
-
-            # 2) If no exact candidate, find any .app and prefer ones containing base_name.
-            app_source = None
-            if candidates:
-                app_source = candidates[0]
-            else:
-                # Primary scan: case-insensitive search for any .app under source_root
-                all_apps = [p for p in source_root.rglob("*") if p.name.lower().endswith(".app")]
-                if all_apps:
-                    matches = [p for p in all_apps if base_name and base_name.lower() in p.name.lower()]
-                    app_source = matches[0] if matches else all_apps[0]
-
-            # 3) Additional fallbacks: the downloaded file itself might be a .app directory
-            if not app_source:
-                if downloaded.exists() and downloaded.name.lower().endswith(".app"):
-                    app_source = downloaded
-                elif downloaded.is_dir():
-                    # search inside downloaded directory
-                    apps_in_download = [p for p in downloaded.rglob("*") if p.name.lower().endswith(".app")]
-                    if apps_in_download:
-                        app_source = apps_in_download[0]
-
-            # 4) As a last resort, also look one level up (some archives place .app next to the archive)
-            if not app_source:
-                parent_apps = [p for p in downloaded.parent.rglob("*") if p.name.lower().endswith(".app")]
-                if parent_apps:
-                    app_source = parent_apps[0]
-
-            if not app_source or not app_source.exists():
-                # Debug output to help locate why matches failed
-                try:
-                    console.print(f"[red]Failed to locate .app for requested name:[/red] {app_name}")
-                    console.print(f"[yellow]Source root:[/yellow] {source_root} (exists={source_root.exists()}, is_dir={source_root.is_dir()})")
-                    # List top-level entries to help debugging
-                    try:
-                        entries = list(sorted(source_root.iterdir()))
-                        console.print(f"[yellow]Top-level entries under source root (showing up to 50):[/yellow]")
-                        for p in entries[:50]:
+                        console.print(f"[red]Failed to locate .app for requested name:[/red] {app_name}")
+                        console.print(f"[yellow]Source root:[/yellow] {source_root} (exists={source_root.exists()}, is_dir={source_root.is_dir()})")
+                        try:
+                            entries = list(sorted(source_root.iterdir()))
+                            console.print(f"[yellow]Top-level entries under source root (showing up to 50):[/yellow]")
+                            for p in entries[:50]:
+                                console.print(f"  - {p} {'(dir)' if p.is_dir() else '(file)'}")
+                            if len(entries) > 50:
+                                console.print(f"  ... and {len(entries)-50} more entries ...")
+                        except Exception:
+                            console.print("  (could not list source_root entries)")
+                        console.print("[yellow]Candidates from exact rglob(app_name):[/yellow]")
+                        for p in candidates:
                             console.print(f"  - {p} {'(dir)' if p.is_dir() else '(file)'}")
-                        if len(entries) > 50:
-                            console.print(f"  ... and {len(entries)-50} more entries ...")
                     except Exception:
-                        console.print("  (could not list source_root entries)")
-                    console.print("[yellow]Candidates from exact rglob(app_name):[/yellow]")
-                    for p in candidates:
-                        console.print(f"  - {p} {'(dir)' if p.is_dir() else '(file)'}")
-                except Exception:
-                    pass
-                try:
-                    console.print("[yellow]All .app entries under source root:[/yellow]")
-                    for p in all_apps:
-                        console.print(f"  - {p} {'(dir)' if p.is_dir() else '(file)'}")
-                except Exception:
-                    pass
-                try:
-                    console.print("[yellow]Apps inside downloaded path (if checked):[/yellow]")
-                    for p in (apps_in_download if 'apps_in_download' in locals() else []):
-                        console.print(f"  - {p} {'(dir)' if p.is_dir() else '(file)'}")
-                except Exception:
-                    pass
-                try:
-                    console.print("[yellow]Parent-dir apps nearby:[/yellow]")
-                    for p in (parent_apps if 'parent_apps' in locals() else []):
-                        console.print(f"  - {p} {'(dir)' if p.is_dir() else '(file)'}")
-                except Exception:
-                    pass
-                try:
-                    console.print(f"[yellow]Downloaded path:[/yellow] {downloaded} (exists={downloaded.exists()}, is_dir={downloaded.is_dir()})")
-                except Exception:
-                    pass
-                raise MacbrewError(f"Could not find {app_name} (or any .app) inside installer media.")
+                        pass
+                    try:
+                        console.print("[yellow]All .app entries under source root:[/yellow]")
+                        for p in all_apps:
+                            console.print(f"  - {p} {'(dir)' if p.is_dir() else '(file)'}")
+                    except Exception:
+                        pass
+                    try:
+                        console.print("[yellow]Apps inside downloaded path (if checked):[/yellow]")
+                        for p in (apps_in_download if 'apps_in_download' in locals() else []):
+                            console.print(f"  - {p} {'(dir)' if p.is_dir() else '(file)'}")
+                    except Exception:
+                        pass
+                    try:
+                        console.print("[yellow]Parent-dir apps nearby:[/yellow]")
+                        for p in (parent_apps if 'parent_apps' in locals() else []):
+                            console.print(f"  - {p} {'(dir)' if p.is_dir() else '(file)'}")
+                    except Exception:
+                        pass
+                    try:
+                        console.print(f"[yellow]Downloaded path:[/yellow] {downloaded} (exists={downloaded.exists()}, is_dir={downloaded.is_dir()})")
+                    except Exception:
+                        pass
+                    raise MacbrewError(f"Could not find {app_name} (or any .app) inside installer media.")
 
-            target_name = Path(app_artifact.get("target", app_name)).name
-            installed_path = self._copy_app_bundle(app_source, install_dir, target_override=target_name)
-            metadata = {
-                "package_kind": "cask",
-                "token": token,
-                "name": cask.get("name") or token,
-                "version": cask.get("version"),
-                "installed_at": time.time(),
-                "source_url": cask.get("url"),
-                "sha256": cask.get("sha256"),
-                "livecheck": cask.get("livecheck"),
-                "install_path": str(installed_path),
-            }
-            self._write_metadata(installed_path / METADATA_FILE, metadata)
-            return [installed_path]
-        finally:
-            if mount_root:
-                self._detach_dmg(mount_root)
-            if extracted_root and extracted_root.exists():
-                shutil.rmtree(extracted_root, ignore_errors=True)
+                target_name = Path(app_artifact.get("target", app_name)).name
+                installed_path = self._copy_app_bundle(app_source, install_dir, target_override=target_name)
+                metadata = {
+                    "package_kind": "cask",
+                    "token": token,
+                    "name": cask.get("name") or token,
+                    "version": cask.get("version"),
+                    "installed_at": time.time(),
+                    "source_url": cask.get("url"),
+                    "sha256": cask.get("sha256"),
+                    "livecheck": cask.get("livecheck"),
+                    "install_path": str(installed_path),
+                }
+                self._write_metadata(installed_path / METADATA_FILE, metadata)
+                return [installed_path]
+            finally:
+                if mount_root:
+                    self._detach_dmg(mount_root)
+                if extracted_root and extracted_root.exists():
+                    shutil.rmtree(extracted_root, ignore_errors=True)
+
+        # pkg-style cask installation
+        pkg_name = pkg_artifact["pkg"][0] if isinstance(pkg_artifact["pkg"], list) else pkg_artifact["pkg"]
+        downloaded = self._download_file(cask["url"], cask.get("sha256"))
+        pkg_path = downloaded
+        if pkg_path.suffix.lower() != ".pkg":
+            extracted = self._extract_if_needed(downloaded)
+            if extracted.is_dir():
+                matches = list(extracted.rglob("*.pkg"))
+                if matches:
+                    pkg_path = matches[0]
+        if not pkg_path.exists() or pkg_path.suffix.lower() != ".pkg":
+            raise MacbrewError(f"Could not find PKG installer for {token}.")
+
+        try:
+            subprocess.check_call(["installer", "-pkg", str(pkg_path), "-target", "/"])
+        except subprocess.CalledProcessError as exc:
+            raise MacbrewError(f"PKG install failed: {exc}")
+
+        metadata = {
+            "package_kind": "cask",
+            "token": token,
+            "name": cask.get("name") or token,
+            "version": cask.get("version"),
+            "installed_at": time.time(),
+            "source_url": cask.get("url"),
+            "sha256": cask.get("sha256"),
+            "livecheck": cask.get("livecheck"),
+            "install_path": str(pkg_path),
+        }
+        self._write_metadata(pkg_path / METADATA_FILE, metadata)
+        return [pkg_path]
 
     def uninstall_cask(self, token: str, zap: bool = False) -> List[Path]:
         cask = self._select_cask_payload(self.detail("cask", token))
         removed: List[Path] = []
-        app_name = next(
-            (a["app"][0] if isinstance(a["app"], list) else a["app"] for a in cask.get("artifacts", []) or [] if "app" in a),
-            None,
-        )
-        if app_name:
-            target = expand_path(self.config.get("install_root", "/Applications")) / app_name
+
+        app_artifact = next((a for a in cask.get("artifacts", []) or [] if "app" in a), None)
+        if app_artifact:
+            app_name = app_artifact["app"][0] if isinstance(app_artifact["app"], list) else app_artifact["app"]
+            target = expand_path(app_artifact.get("target") or str(Path(self.config.get("install_root", "/Applications")) / app_name))
             if target.exists():
                 if target.is_dir():
-                    shutil.rmtree(target)
+                    shutil.rmtree(target, ignore_errors=True)
                 else:
-                    target.unlink()
+                    target.unlink(missing_ok=True)
                 removed.append(target)
+
+        for artifact in cask.get("artifacts", []) or []:
+            if "uninstall" in artifact:
+                uninstall_data = artifact["uninstall"]
+                if isinstance(uninstall_data, dict):
+                    uninstall_data = [uninstall_data]
+                for rule in uninstall_data or []:
+                    if not isinstance(rule, dict):
+                        continue
+                    if "pkgutil" in rule:
+                        pkgutil_ids = rule["pkgutil"]
+                        if isinstance(pkgutil_ids, str):
+                            pkgutil_ids = [pkgutil_ids]
+                        for pkg_id in pkgutil_ids:
+                            try:
+                                subprocess.check_call(["pkgutil", "--forget", pkg_id])
+                            except Exception:
+                                pass
+                    if "delete" in rule:
+                        for path_item in rule.get("delete", []) or []:
+                            for cp in cleanup_pattern(path_item):
+                                try:
+                                    if cp.is_dir():
+                                        shutil.rmtree(cp, ignore_errors=True)
+                                    elif cp.exists() or cp.is_symlink():
+                                        cp.unlink(missing_ok=True)
+                                    removed.append(cp)
+                                except Exception:
+                                    pass
+                    if "trash" in rule:
+                        for path_item in rule.get("trash", []) or []:
+                            for cp in cleanup_pattern(path_item):
+                                try:
+                                    if cp.is_dir():
+                                        shutil.rmtree(cp, ignore_errors=True)
+                                    elif cp.exists() or cp.is_symlink():
+                                        cp.unlink(missing_ok=True)
+                                    removed.append(cp)
+                                except Exception:
+                                    pass
 
         if zap:
             for a in cask.get("artifacts", []) or []:
                 if "zap" in a:
-                    for rule in a.get("zap", []):
+                    for rule in a.get("zap", []) or []:
                         if isinstance(rule, dict):
                             for p in rule.get("trash", []) or []:
                                 for cp in cleanup_pattern(p):
