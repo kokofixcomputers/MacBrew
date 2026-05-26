@@ -48,7 +48,9 @@ CONFIG_DIR = Path.home() / f".{APP_NAME}"
 CACHE_DIR = CONFIG_DIR / "cache"
 DOWNLOAD_DIR = CONFIG_DIR / "downloads"
 TAPS_DIR = CONFIG_DIR / "taps"
+METADATA_DIR = CONFIG_DIR / "metadata"
 CONFIG_PATH = CONFIG_DIR / "config.json"
+METADATA_FILE = ".macbrew-meta.json"
 DEFAULT_CONFIG = {
     "install_root": "/Applications",
     "formula_prefix": "/opt/macbrew",
@@ -79,6 +81,7 @@ class Macbrew:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
         DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
         TAPS_DIR.mkdir(parents=True, exist_ok=True)
+        METADATA_DIR.mkdir(parents=True, exist_ok=True)
         self.config = self._load_config()
         self._installing: set = set()
         self._index_cache: Dict[str, List[Dict[str, Any]]] = {}
@@ -119,6 +122,234 @@ class Macbrew:
     def _is_fresh(self, path: Path) -> bool:
         ttl = int(self.config.get("cache_ttl_seconds", CACHE_TTL_SECONDS))
         return path.exists() and (time.time() - path.stat().st_mtime) < ttl
+
+    def _get_metadata_path(self, kind: str, token: str, version: Optional[str] = None) -> Path:
+        """Get the centralized metadata path for a package in ~/.macbrew/metadata/"""
+        if version:
+            return METADATA_DIR / kind / token / f"{version}.json"
+        return METADATA_DIR / kind / token / "metadata.json"
+
+    def _remove_metadata(self, kind: str, token: str, version: Optional[str] = None) -> None:
+        """Remove metadata from the centralized metadata directory"""
+        if version:
+            meta_path = self._get_metadata_path(kind, token, version)
+            if meta_path.exists():
+                meta_path.unlink()
+        else:
+            token_dir = METADATA_DIR / kind / token
+            if token_dir.exists():
+                shutil.rmtree(token_dir, ignore_errors=True)
+
+        # Clean up empty directories
+        try:
+            kind_dir = METADATA_DIR / kind
+            if kind_dir.exists() and not any(kind_dir.iterdir()):
+                kind_dir.rmdir()
+        except Exception:
+            pass
+
+    def _remove_download_cache(self, source_url: Optional[str], token: str) -> None:
+        if not source_url:
+            return
+        filename = Path(urlparse(source_url).path).name
+        if not filename:
+            return
+        download_path = DOWNLOAD_DIR / filename
+        if download_path.exists():
+            try:
+                download_path.unlink()
+            except Exception:
+                pass
+
+    def _write_metadata(self, path: Path, metadata: Dict[str, Any]) -> None:
+        """Write metadata to the centralized metadata directory in ~/.macbrew/metadata/"""
+        kind = metadata.get("package_kind", "")
+        token = metadata.get("token", "")
+        version = metadata.get("version")
+        if isinstance(version, str) and version.strip() == "":
+            version = None
+
+        if kind and token:
+            # Write to centralized location
+            meta_path = self._get_metadata_path(kind, token, version)
+            meta_path.parent.mkdir(parents=True, exist_ok=True)
+            meta_path.write_text(json.dumps(metadata, indent=2) + "\n")
+        else:
+            # Fallback for legacy usage
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(metadata, indent=2) + "\n")
+
+    def _read_metadata(self, path: Path) -> Optional[Dict[str, Any]]:
+        try:
+            return json.loads(path.read_text())
+        except Exception:
+            return None
+
+    def _installed_formula_metadata(self) -> List[Dict[str, Any]]:
+        """Load formula metadata from centralized metadata directory"""
+        installed: List[Dict[str, Any]] = []
+        formula_dir = METADATA_DIR / "formula"
+        if not formula_dir.exists():
+            return installed
+        
+        for token_dir in sorted(formula_dir.iterdir()):
+            if not token_dir.is_dir():
+                continue
+            for meta_file in sorted(token_dir.glob("*.json")):
+                try:
+                    data = json.loads(meta_file.read_text())
+                    if data:
+                        installed.append(data)
+                except Exception:
+                    pass
+        return installed
+
+    def _installed_cask_metadata(self) -> List[Dict[str, Any]]:
+        """Load cask metadata from centralized metadata directory"""
+        installed: List[Dict[str, Any]] = []
+        cask_dir = METADATA_DIR / "cask"
+        if not cask_dir.exists():
+            return installed
+        
+        for token_dir in sorted(cask_dir.iterdir()):
+            if not token_dir.is_dir():
+                continue
+            for meta_file in sorted(token_dir.glob("*.json")):
+                try:
+                    data = json.loads(meta_file.read_text())
+                    if data:
+                        installed.append(data)
+                except Exception:
+                    pass
+        return installed
+
+    def _installed_metadata(self) -> List[Dict[str, Any]]:
+        return self._installed_formula_metadata() + self._installed_cask_metadata()
+
+    async def _fetch_json_direct_async(self, url: str) -> Any:
+        async with self._get_client() as client:
+            response = await client.get(url)
+            response.raise_for_status()
+            return response.json()
+
+    def _fetch_livecheck_version(self, livecheck: Dict[str, Any]) -> Optional[str]:
+        if not livecheck or not livecheck.get("url"):
+            return None
+        
+        strategy = livecheck.get("strategy", "unknown")
+        
+        try:
+            if strategy == "json":
+                return self._fetch_json_livecheck_version(livecheck)
+            elif strategy == "sparkle":
+                return self._fetch_sparkle_livecheck_version(livecheck)
+            elif strategy == "regex":
+                return self._fetch_regex_livecheck_version(livecheck)
+        except Exception:
+            pass
+        
+        return None
+
+    def _fetch_json_livecheck_version(self, livecheck: Dict[str, Any]) -> Optional[str]:
+        """Fetch version from JSON endpoint using json.dig path"""
+        try:
+            data = self._run(self._fetch_json_direct_async(livecheck["url"]))
+            if data is None:
+                return None
+            path = livecheck.get("json_path") or []
+            if isinstance(path, list) and path:
+                value = data
+                for key in path:
+                    if isinstance(value, dict):
+                        value = value.get(key)
+                    else:
+                        return None
+                return str(value) if value is not None else None
+            return None
+        except Exception:
+            return None
+
+    def _fetch_sparkle_livecheck_version(self, livecheck: Dict[str, Any]) -> Optional[str]:
+        """Fetch version from Sparkle appcast XML feed"""
+        try:
+            text = self._run(self._fetch_text_async(livecheck["url"]))
+            if not text:
+                return None
+            
+            # Extract version method
+            version_method = livecheck.get("sparkle_version_method", "version")
+            
+            # Try to extract version from XML
+            # Sparkle appcast typically has items with version or shortVersionString attributes
+            if version_method == "short_version":
+                # Look for shortVersionString attribute
+                m = re.search(r'shortVersionString="([^"]+)"', text)
+                if m:
+                    return m.group(1)
+            
+            # Fallback: look for version attribute
+            m = re.search(r'(?:version|sparkle:version)="([^"]+)"', text)
+            if m:
+                return m.group(1)
+            
+            # Also try looking in item version tags
+            m = re.search(r'<version>([^<]+)</version>', text)
+            if m:
+                return m.group(1)
+            
+            return None
+        except Exception:
+            return None
+
+    def _fetch_regex_livecheck_version(self, livecheck: Dict[str, Any]) -> Optional[str]:
+        """Fetch version by applying regex to page content"""
+        try:
+            text = self._run(self._fetch_text_async(livecheck["url"]))
+            if not text:
+                return None
+            
+            regex_pattern = livecheck.get("regex")
+            if not regex_pattern:
+                return None
+            
+            # Compile regex with case-insensitive flag if needed
+            try:
+                # Try with case-insensitive flag first (common for version matching)
+                pattern = re.compile(regex_pattern, re.IGNORECASE)
+            except re.error:
+                # Fall back to no flags
+                pattern = re.compile(regex_pattern)
+            
+            m = pattern.search(text)
+            if m:
+                # Return first capture group if it exists, otherwise the whole match
+                if m.groups():
+                    return m.group(1)
+                else:
+                    return m.group(0)
+            
+            return None
+        except Exception:
+            return None
+
+    def _latest_index_version(self, kind: str, token: str) -> Optional[str]:
+        try:
+            index = self._load_index(kind)
+            entry = next((i for i in index if i.get("token") == token or i.get("name") == token), None)
+            if entry and entry.get("version"):
+                return str(entry["version"])
+        except Exception:
+            pass
+        try:
+            detail = self.detail(kind, token)
+            return detail.get("version")
+        except Exception:
+            return None
+
+    def _is_version_outdated(self, installed_version: str, latest_version: Optional[str]) -> bool:
+        if not latest_version:
+            return False
+        return installed_version != latest_version
 
     async def _fetch_text_async(self, url: str) -> str:
         async with httpx.AsyncClient(
@@ -662,6 +893,16 @@ class Macbrew:
                             link.unlink()
                         link.symlink_to(exe)
 
+            metadata = {
+                "package_kind": "formula",
+                "token": token,
+                "version": version,
+                "installed_at": time.time(),
+                "source_url": url,
+                "sha256": sha256,
+                "install_path": str(cellar_version),
+            }
+            self._write_metadata(cellar_version / METADATA_FILE, metadata)
             console.print(f"[bold green]✔ Installed formula:[/bold green] {token} {version}")
         finally:
             self._installing.discard(token)
@@ -801,6 +1042,18 @@ class Macbrew:
 
             target_name = Path(app_artifact.get("target", app_name)).name
             installed_path = self._copy_app_bundle(app_source, install_dir, target_override=target_name)
+            metadata = {
+                "package_kind": "cask",
+                "token": token,
+                "name": cask.get("name") or token,
+                "version": cask.get("version"),
+                "installed_at": time.time(),
+                "source_url": cask.get("url"),
+                "sha256": cask.get("sha256"),
+                "livecheck": cask.get("livecheck"),
+                "install_path": str(installed_path),
+            }
+            self._write_metadata(installed_path / METADATA_FILE, metadata)
             return [installed_path]
         finally:
             if mount_root:
@@ -839,11 +1092,41 @@ class Macbrew:
                                         removed.append(cp)
                                     except Exception:
                                         pass
+
+        # Remove metadata and cached download from centralized location
+        self._remove_metadata(kind="cask", token=token)
+        self._remove_download_cache(cask.get("url"), token)
+
         return removed
 
     def update_cask(self, token: str) -> List[Path]:
         self.uninstall_cask(token, zap=False)
         return self.install_cask(token)
+
+    def outdated(self) -> List[Dict[str, Any]]:
+        outdated_items: List[Dict[str, Any]] = []
+        for item in self._installed_metadata():
+            installed_version = item.get("version")
+            if not installed_version:
+                continue
+            latest_version = None
+            if item.get("livecheck"):
+                latest_version = self._fetch_livecheck_version(item["livecheck"])
+            if not latest_version:
+                kind = item.get("package_kind")
+                latest_version = self._latest_index_version(kind, item.get("token", ""))
+            if self._is_version_outdated(installed_version, latest_version):
+                outdated_items.append(
+                    {
+                        "token": item.get("token"),
+                        "name": item.get("name") or item.get("token"),
+                        "kind": item.get("package_kind"),
+                        "installed_version": installed_version,
+                        "latest_version": latest_version,
+                        "path": item.get("target") or item.get("install_path") or "",
+                    }
+                )
+        return outdated_items
 
     async def show_async(self, query: str) -> Dict[str, Any]:
         kind, token = self.resolve(query)
@@ -1212,6 +1495,23 @@ def cmd_cleanup(app: Macbrew, args: argparse.Namespace) -> None:
     console.print(f"[bold green]✔ Removed {removed_downloads} downloaded archives.[/bold green]")
 
 
+def cmd_outdated(app: Macbrew, args: argparse.Namespace) -> None:
+    items = app.outdated()
+    if not items:
+        console.print("[bold green]All installed packages are up to date.[/bold green]")
+        return
+    t = Table("TYPE", "TOKEN", "INSTALLED", "LATEST", "PATH", title="Outdated Packages", box=box.SIMPLE_HEAVY, border_style="yellow")
+    for item in items:
+        t.add_row(
+            item["kind"],
+            item["token"],
+            item["installed_version"],
+            item["latest_version"] or "?",
+            item["path"] or "",
+        )
+    console.print(t)
+
+
 def cmd_tap(app: Macbrew, args: argparse.Namespace) -> None:
     info = app.tap(args.repo)
     print_tap_results(info)
@@ -1273,6 +1573,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp.add_parser("cleanup", help="Delete cached metadata and downloaded archives")
 
+    sp.add_parser("outdated", help="Show installed formulae and casks that are outdated")
+
     return p
 
 
@@ -1292,6 +1594,7 @@ def main() -> int:
             "tap-list": cmd_tap_list,
             "untap": cmd_untap,
             "cleanup": cmd_cleanup,
+            "outdated": cmd_outdated,
         }
         dispatch[args.command](app, args)
         return 0

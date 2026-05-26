@@ -27,9 +27,117 @@ CASK_ZAP_PATTERN = re.compile(r'zap\s+trash:\s+\[(.*?)\]', re.DOTALL)
 CASK_CONFLICT_PATTERN = re.compile(r'conflicts_with\s+cask:\s+"([^"]+)"')
 CASK_DEPENDS_MACOS_PATTERN = re.compile(r'depends_on\s+macos:\s+"([^"]+)"')
 CASK_DEPENDS_MACOS_FLAG_PATTERN = re.compile(r'depends_on\s+:macos')
+JSON_DIG_PATTERN = re.compile(r'json\.dig\(([^)]+)\)')
 
 
-def parse_formula_rb(rb: str) -> Dict[str, Any]:
+def _extract_do_block(rb: str, start: int) -> Optional[str]:
+    depth = 0
+    i = start
+    while i < len(rb):
+        m = re.search(r'\b(do|end)\b', rb[i:])
+        if not m:
+            break
+        token = m.group(1)
+        token_start = i + m.start()
+        if token == "do":
+            depth += 1
+        elif token == "end":
+            depth -= 1
+            if depth == 0:
+                return rb[start:token_start]
+        i = token_start + len(token)
+    return None
+
+
+def _extract_ruby_paren_expr(text: str, start: int) -> Optional[str]:
+    depth = 1
+    i = start
+    in_string = False
+    string_delim = None
+    in_regex = False
+    escape = False
+    while i < len(text):
+        ch = text[i]
+        if escape:
+            escape = False
+        elif ch == "\\":
+            escape = True
+        elif in_string:
+            if ch == string_delim:
+                in_string = False
+        elif in_regex:
+            if ch == "/":
+                in_regex = False
+        else:
+            if ch in {"'", '"'}:
+                in_string = True
+                string_delim = ch
+            elif ch == "/":
+                in_regex = True
+            elif ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return text[start:i]
+        i += 1
+    return None
+
+
+def _parse_livecheck(rb: str, arch_token: str, version: str) -> Optional[Dict[str, Any]]:
+    idx = rb.find("livecheck")
+    if idx == -1:
+        return None
+    do_idx = rb.find("do", idx)
+    if do_idx == -1:
+        return None
+    block = _extract_do_block(rb, do_idx)
+    if not block:
+        return None
+    out: Dict[str, Any] = {}
+    m = re.search(r'^\s*url\s+"([^"]+)"', block, re.MULTILINE)
+    if m:
+        url = m.group(1)
+        url = url.replace("#{arch}", arch_token)
+        url = url.replace("#{version}", version)
+        url = url.replace("#{folder}", "mac")  # Default folder for sparkle
+        out["url"] = url
+    m = re.search(r'^\s*strategy\s+:(\w+)', block, re.MULTILINE)
+    if m:
+        out["strategy"] = m.group(1)
+        if out["strategy"] == "json":
+            m2 = JSON_DIG_PATTERN.search(block)
+            if m2:
+                out["json_path"] = [p.strip().strip('"').strip("'") for p in re.findall(r'"([^"]+)"|\'([^\']+)\'', m2.group(1)) if p]
+        elif out["strategy"] == "sparkle":
+            # Check for optional block like &:short_version
+            if "&:short_version" in block:
+                out["sparkle_version_method"] = "short_version"
+            elif "&:version" in block:
+                out["sparkle_version_method"] = "version"
+            else:
+                out["sparkle_version_method"] = "version"  # default
+    
+    regex_idx = block.find("regex(")
+    if regex_idx != -1:
+        expr = _extract_ruby_paren_expr(block, regex_idx + len("regex("))
+        if expr is not None:
+            regex_str = expr.strip()
+            if regex_str.startswith("r\"") or regex_str.startswith("r'"):
+                regex_str = regex_str[2:-1]
+            elif regex_str.startswith('"') or regex_str.startswith("'"):
+                regex_str = regex_str[1:-1]
+            elif regex_str.startswith("/"):
+                last_slash = regex_str.rfind("/")
+                if last_slash > 0:
+                    regex_str = regex_str[1:last_slash]
+            out["regex"] = regex_str
+            out["strategy"] = out.get("strategy", "regex")
+
+    return out if out else None
+
+
+def parse_formula_rb(rb: str, arch_token: str = "arm64") -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     m = CLASS_PATTERN.search(rb)
     if m:
@@ -85,6 +193,9 @@ def parse_formula_rb(rb: str) -> Dict[str, Any]:
     out["optional_dependencies"] = DEPEND_OPTIONAL_PATTERN.findall(rb)
     out["deprecated"] = bool(DEPRECATE_PATTERN.search(rb))
     out["disabled"] = bool(DISABLE_PATTERN.search(rb))
+    livecheck = _parse_livecheck(rb, arch_token, out.get("version", ""))
+    if livecheck:
+        out["livecheck"] = livecheck
     return out
 
 
@@ -136,6 +247,9 @@ def parse_cask_rb(rb: str, arch_token: str) -> Dict[str, Any]:
         out["depends_on"] = {"macos": None}
     out["deprecated"] = bool(DEPRECATE_PATTERN.search(rb))
     out["disabled"] = bool(DISABLE_PATTERN.search(rb))
+    livecheck = _parse_livecheck(rb, arch_token, out.get("version", ""))
+    if livecheck:
+        out["livecheck"] = livecheck
     return out
 
 
