@@ -157,8 +157,38 @@ class Macbrew:
             return self._index_cache[kind]
         path = self._cache_file(kind)
         if not path.exists() or (self.config.get("auto_refresh", True) and not self._is_fresh(path)):
-            self._run(self.refresh(force=False))
-        data = json.loads(path.read_text())
+            try:
+                asyncio.get_running_loop()
+                running = True
+            except RuntimeError:
+                running = False
+
+            if running:
+                # We're already inside an event loop (e.g. called from an async context).
+                # Use a synchronous HTTP fetch here to avoid calling asyncio.run()
+                url = FORMULA_INDEX_URL if kind == "formula" else CASK_INDEX_URL
+                try:
+                    client = httpx.Client(
+                        headers={"User-Agent": f"{APP_NAME}/0.1"},
+                        timeout=TIMEOUT,
+                        follow_redirects=True,
+                    )
+                    resp = client.get(url)
+                    resp.raise_for_status()
+                    data = resp.json()
+                finally:
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps(data, indent=2) + "\n")
+            else:
+                self._run(self.refresh(force=False))
+                data = json.loads(path.read_text())
+        else:
+            # Cache exists and is fresh (or auto_refresh disabled) — read it
+            data = json.loads(path.read_text())
         self._index_cache[kind] = data
         self._prepare_search_cache(kind, data)
         return data
@@ -438,12 +468,37 @@ class Macbrew:
         async with self._get_client() as client:
             async with client.stream("GET", url) as response:
                 response.raise_for_status()
+                total = int(response.headers.get("Content-Length") or 0)
+                bar_width = 40
+                downloaded_bytes = 0
+                last_print = 0.0
                 with destination.open("wb") as fh:
                     async for chunk in response.aiter_bytes(1024 * 1024):
                         if not chunk:
                             continue
                         fh.write(chunk)
                         hasher.update(chunk)
+                        downloaded_bytes += len(chunk)
+                        # Throttle updates to ~10Hz
+                        now = time.time()
+                        if now - last_print >= 0.1:
+                            last_print = now
+                            if total:
+                                frac = min(1.0, downloaded_bytes / total)
+                                filled = int(frac * bar_width)
+                                bar = "=" * max(0, filled - 1) + (">" if filled > 0 and filled < bar_width else "=") + " " * max(0, bar_width - filled)
+                                pct = int(frac * 100)
+                                console.print(f"[cyan][{bar}][/cyan] [bold]{pct}%[/bold] {downloaded_bytes // 1024}KB/{total // 1024}KB", end="\r")
+                            else:
+                                console.print(f"[cyan]Downloading...[/cyan] [bold]{downloaded_bytes // 1024}KB[/bold]", end="\r")
+                # ensure final newline/complete bar
+                try:
+                    if total:
+                        console.print()
+                    else:
+                        console.print()
+                except Exception:
+                    pass
         if expected_sha256 and expected_sha256 != "no_check":
             actual = hasher.hexdigest()
             if actual.lower() != expected_sha256.lower():
@@ -635,9 +690,114 @@ class Macbrew:
                 source_root = self._extract_if_needed(downloaded)
                 extracted_root = source_root
 
-            app_source = next(source_root.rglob(app_name), None)
+                # If extraction returned the parent directory (common when file has no known suffix),
+                # try to detect archive content and extract, or attempt to mount as a dmg.
+                if source_root.is_file() or (source_root.exists() and len(list(source_root.iterdir())) == 1 and list(source_root.iterdir())[0] == downloaded):
+                    # Try zip
+                    try:
+                        if zipfile.is_zipfile(downloaded):
+                            out = Path(tempfile.mkdtemp(prefix="macbrew-unzip-"))
+                            with zipfile.ZipFile(downloaded) as zf:
+                                zf.extractall(out)
+                            source_root = out
+                            extracted_root = out
+                        elif tarfile.is_tarfile(downloaded):
+                            out = Path(tempfile.mkdtemp(prefix="macbrew-untar-"))
+                            with tarfile.open(downloaded) as tf:
+                                tf.extractall(out)
+                            source_root = out
+                            extracted_root = out
+                        else:
+                            # As a last resort, try mounting the file as a dmg (hdiutil can often mount raw images)
+                            try:
+                                mount_try = self._mount_dmg(downloaded)
+                                source_root = mount_try
+                                mount_root = mount_try
+                            except Exception:
+                                pass
+                    except Exception:
+                        # ignore extraction errors and continue with original source_root
+                        pass
+
+            # Try several strategies to locate the app bundle inside the installer media.
+            # Normalize base name without the .app suffix for fuzzy matching.
+            base_name = app_name[:-4] if app_name.lower().endswith(".app") else app_name
+
+            # 1) Exact matches (allow both with and without .app)
+            candidates = list(source_root.rglob(app_name))
+            if not candidates and not app_name.lower().endswith(".app"):
+                candidates = list(source_root.rglob(f"{app_name}.app"))
+
+            # 2) If no exact candidate, find any .app and prefer ones containing base_name.
+            app_source = None
+            if candidates:
+                app_source = candidates[0]
+            else:
+                # Primary scan: case-insensitive search for any .app under source_root
+                all_apps = [p for p in source_root.rglob("*") if p.name.lower().endswith(".app")]
+                if all_apps:
+                    matches = [p for p in all_apps if base_name and base_name.lower() in p.name.lower()]
+                    app_source = matches[0] if matches else all_apps[0]
+
+            # 3) Additional fallbacks: the downloaded file itself might be a .app directory
+            if not app_source:
+                if downloaded.exists() and downloaded.name.lower().endswith(".app"):
+                    app_source = downloaded
+                elif downloaded.is_dir():
+                    # search inside downloaded directory
+                    apps_in_download = [p for p in downloaded.rglob("*") if p.name.lower().endswith(".app")]
+                    if apps_in_download:
+                        app_source = apps_in_download[0]
+
+            # 4) As a last resort, also look one level up (some archives place .app next to the archive)
+            if not app_source:
+                parent_apps = [p for p in downloaded.parent.rglob("*") if p.name.lower().endswith(".app")]
+                if parent_apps:
+                    app_source = parent_apps[0]
+
             if not app_source or not app_source.exists():
-                raise MacbrewError(f"Could not find {app_name} inside installer media.")
+                # Debug output to help locate why matches failed
+                try:
+                    console.print(f"[red]Failed to locate .app for requested name:[/red] {app_name}")
+                    console.print(f"[yellow]Source root:[/yellow] {source_root} (exists={source_root.exists()}, is_dir={source_root.is_dir()})")
+                    # List top-level entries to help debugging
+                    try:
+                        entries = list(sorted(source_root.iterdir()))
+                        console.print(f"[yellow]Top-level entries under source root (showing up to 50):[/yellow]")
+                        for p in entries[:50]:
+                            console.print(f"  - {p} {'(dir)' if p.is_dir() else '(file)'}")
+                        if len(entries) > 50:
+                            console.print(f"  ... and {len(entries)-50} more entries ...")
+                    except Exception:
+                        console.print("  (could not list source_root entries)")
+                    console.print("[yellow]Candidates from exact rglob(app_name):[/yellow]")
+                    for p in candidates:
+                        console.print(f"  - {p} {'(dir)' if p.is_dir() else '(file)'}")
+                except Exception:
+                    pass
+                try:
+                    console.print("[yellow]All .app entries under source root:[/yellow]")
+                    for p in all_apps:
+                        console.print(f"  - {p} {'(dir)' if p.is_dir() else '(file)'}")
+                except Exception:
+                    pass
+                try:
+                    console.print("[yellow]Apps inside downloaded path (if checked):[/yellow]")
+                    for p in (apps_in_download if 'apps_in_download' in locals() else []):
+                        console.print(f"  - {p} {'(dir)' if p.is_dir() else '(file)'}")
+                except Exception:
+                    pass
+                try:
+                    console.print("[yellow]Parent-dir apps nearby:[/yellow]")
+                    for p in (parent_apps if 'parent_apps' in locals() else []):
+                        console.print(f"  - {p} {'(dir)' if p.is_dir() else '(file)'}")
+                except Exception:
+                    pass
+                try:
+                    console.print(f"[yellow]Downloaded path:[/yellow] {downloaded} (exists={downloaded.exists()}, is_dir={downloaded.is_dir()})")
+                except Exception:
+                    pass
+                raise MacbrewError(f"Could not find {app_name} (or any .app) inside installer media.")
 
             target_name = Path(app_artifact.get("target", app_name)).name
             installed_path = self._copy_app_bundle(app_source, install_dir, target_override=target_name)
