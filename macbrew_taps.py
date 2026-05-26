@@ -1,10 +1,12 @@
+import asyncio
 import subprocess
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from macbrew_utils import TAPS_DIR, expand_path
 
-
+@lru_cache(maxsize=128)
 def normalize_tap_input(value: str) -> Tuple[str, str, str, str]:
     raw = value.strip()
     if raw.startswith("http://github.com/"):
@@ -28,6 +30,7 @@ def tap_local_dir(owner: str, repo: str) -> Path:
     return TAPS_DIR / owner / repo
 
 
+@lru_cache(maxsize=64)
 def tap_branch(local: Path) -> str:
     try:
         out = subprocess.check_output(["git", "-C", str(local), "branch", "--show-current"], text=True).strip()
@@ -48,4 +51,9 @@ def ensure_tap_repo(value: str) -> Tuple[Path, str, str, str]:
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+    tap_branch.cache_clear()
     return local, url, owner, repo
+
+
+async def ensure_tap_repo_async(value: str) -> Tuple[Path, str, str, str]:
+    return await asyncio.to_thread(ensure_tap_repo, value)

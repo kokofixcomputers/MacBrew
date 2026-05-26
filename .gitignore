@@ -1,0 +1,9 @@
+/__pycache___/
+*.pyc
+*.pyo
+/main.build/
+/main.dist/
+/main.onefile-build/
+/.eggs/
+/dist/
+/build/

@@ -1,4 +1,16 @@
-import os, platform, re, json, time, subprocess, shutil, hashlib, tempfile, zipfile, tarfile
+import asyncio
+import os
+import platform
+import re
+import json
+import time
+import subprocess
+import shutil
+import hashlib
+import tempfile
+import zipfile
+import tarfile
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -20,11 +32,13 @@ def expand_path(p: str) -> Path:
     return Path(os.path.expandvars(os.path.expanduser(p))).resolve()
 
 
+@lru_cache(maxsize=1)
 def arch_name() -> str:
     m = platform.machine().lower()
     return "arm64" if m in {"arm64", "aarch64"} else "x86_64"
 
 
+@lru_cache(maxsize=1)
 def macos_codename() -> Optional[str]:
     try:
         version = platform.mac_ver()[0]
@@ -76,4 +90,31 @@ def _load_json_cache(path: Path, fetcher) -> Any:
     data = fetcher()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2) + "\n")
+    return data
+
+
+async def read_text_async(path: Path) -> str:
+    return await asyncio.to_thread(path.read_text)
+
+
+async def write_text_async(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    await asyncio.to_thread(path.write_text, content)
+
+
+async def load_text_cache_async(path: Path, fetcher) -> str:
+    if _is_fresh(path):
+        return await read_text_async(path)
+    text = await asyncio.to_thread(fetcher)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    await asyncio.to_thread(path.write_text, text)
+    return text
+
+
+async def load_json_cache_async(path: Path, fetcher) -> Any:
+    if _is_fresh(path):
+        return json.loads(await read_text_async(path))
+    data = await asyncio.to_thread(fetcher)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    await asyncio.to_thread(path.write_text, json.dumps(data, indent=2) + "\n")
     return data

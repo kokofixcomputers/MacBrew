@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import asyncio
 import hashlib
 import json
 import os
@@ -17,7 +18,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
-import requests
+import httpx
 from InquirerPy import inquirer
 from InquirerPy.validator import PathValidator
 from rapidfuzz import fuzz
@@ -78,10 +79,12 @@ class Macbrew:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
         DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
         TAPS_DIR.mkdir(parents=True, exist_ok=True)
-        self.session = requests.Session()
-        self.session.headers.update({"User-Agent": f"{APP_NAME}/0.1"})
         self.config = self._load_config()
         self._installing: set = set()
+        self._index_cache: Dict[str, List[Dict[str, Any]]] = {}
+        self._formula_search_items: List[Tuple[Dict[str, Any], List[str], str]] = []
+        self._cask_search_items: List[Tuple[Dict[str, Any], List[str], str]] = []
+        self._tap_items_cache: Optional[List[Dict[str, Any]]] = None
 
     def _load_config(self) -> Dict[str, Any]:
         if not CONFIG_PATH.exists():
@@ -95,13 +98,19 @@ class Macbrew:
     def save_config(self) -> None:
         CONFIG_PATH.write_text(json.dumps(self.config, indent=2) + "\n")
 
+    def _run(self, coro):
+        return asyncio.run(coro)
+
+    def _get_client(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            headers={"User-Agent": f"{APP_NAME}/0.1"},
+            timeout=TIMEOUT,
+            follow_redirects=True,
+            limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
+        )
+
     def _cache_file(self, kind: str) -> Path:
         return CACHE_DIR / f"{kind}.json"
-
-    def _fetch_text(self, session, url: str) -> str:
-        r = session.get(url, timeout=TIMEOUT)
-        r.raise_for_status()
-        return r.text
 
     def _detail_cache_file(self, kind: str, token: str) -> Path:
         safe = token.replace("/", "_").replace("@", "_")
@@ -111,53 +120,98 @@ class Macbrew:
         ttl = int(self.config.get("cache_ttl_seconds", CACHE_TTL_SECONDS))
         return path.exists() and (time.time() - path.stat().st_mtime) < ttl
 
-    def _fetch_json(self, url: str, cache_path: Path, force: bool = False) -> Any:
-        if not force and self._is_fresh(cache_path):
-            return json.loads(cache_path.read_text())
-        response = self.session.get(url, timeout=TIMEOUT)
-        response.raise_for_status()
-        cache_path.write_text(response.text)
-        return response.json()
+    async def _fetch_text_async(self, url: str) -> str:
+        async with httpx.AsyncClient(
+            headers={"User-Agent": f"{APP_NAME}/0.1"},
+            timeout=TIMEOUT,
+            limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
+        ) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+            return response.text
 
-    def refresh(self, force: bool = False) -> None:
-        self._fetch_json(FORMULA_INDEX_URL, self._cache_file("formula"), force=force)
-        self._fetch_json(CASK_INDEX_URL, self._cache_file("cask"), force=force)
+    async def _fetch_json_async(self, url: str, cache_path: Path, force: bool = False) -> Any:
+        if not force and self._is_fresh(cache_path):
+            return json.loads(await asyncio.to_thread(cache_path.read_text))
+        async with httpx.AsyncClient(
+            headers={"User-Agent": f"{APP_NAME}/0.1"},
+            timeout=TIMEOUT,
+            limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
+        ) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+            data = response.json()
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        await asyncio.to_thread(cache_path.write_text, json.dumps(data, indent=2) + "\n")
+        return data
+
+    async def refresh(self, force: bool = False) -> None:
+        await asyncio.gather(
+            self._fetch_json_async(FORMULA_INDEX_URL, self._cache_file("formula"), force=force),
+            self._fetch_json_async(CASK_INDEX_URL, self._cache_file("cask"), force=force),
+        )
+        self._index_cache.clear()
 
     def _load_index(self, kind: str) -> List[Dict[str, Any]]:
+        if kind in self._index_cache:
+            return self._index_cache[kind]
         path = self._cache_file(kind)
         if not path.exists() or (self.config.get("auto_refresh", True) and not self._is_fresh(path)):
-            self.refresh(force=False)
-        return json.loads(path.read_text())
+            self._run(self.refresh(force=False))
+        data = json.loads(path.read_text())
+        self._index_cache[kind] = data
+        self._prepare_search_cache(kind, data)
+        return data
 
-    def _score_formula(self, item: Dict[str, Any], query: str) -> float:
+    def _prepare_search_cache(self, kind: str, data: List[Dict[str, Any]]) -> None:
+        if kind == "formula":
+            self._formula_search_items = []
+            for item in data:
+                name = item.get("name", "")
+                aliases = item.get("aliases", []) or []
+                candidates = [name, *aliases]
+                normalized = [c.lower() for c in candidates if c]
+                desc = (item.get("desc", "") or "").lower()
+                self._formula_search_items.append((item, normalized, desc))
+        else:
+            self._cask_search_items = []
+            for item in data:
+                token = item.get("token", "")
+                names = item.get("name", []) or []
+                old_tokens = item.get("old_tokens", []) or []
+                candidates = [token, *names, *old_tokens]
+                normalized = [c.lower() for c in candidates if c]
+                desc = (item.get("desc", "") or "").lower()
+                self._cask_search_items.append((item, normalized, desc))
+
+    def _score_formula(self, candidates: List[str], desc: str, query: str) -> float:
         q = query.lower().strip()
-        name = item.get("name", "")
-        desc = item.get("desc", "") or ""
-        aliases = item.get("aliases", []) or []
-        candidates = [name, *aliases]
-        best_name = max((fuzz.WRatio(q, c.lower()) for c in candidates if c), default=0)
-        desc_score = fuzz.partial_ratio(q, desc.lower()) if desc else 0
-        prefix_bonus = 15 if any(c.lower().startswith(q) for c in candidates) else 0
-        exact_bonus = 20 if any(c.lower() == q for c in candidates) else 0
+        best_name = max((fuzz.WRatio(q, c) for c in candidates if c), default=0)
+        desc_score = fuzz.partial_ratio(q, desc) if desc else 0
+        prefix_bonus = 15 if any(c.startswith(q) for c in candidates) else 0
+        exact_bonus = 20 if any(c == q for c in candidates) else 0
         return best_name * 0.7 + desc_score * 0.3 + prefix_bonus + exact_bonus
 
-    def _score_cask(self, item: Dict[str, Any], query: str) -> float:
+    def _score_cask(self, candidates: List[str], desc: str, query: str) -> float:
         q = query.lower().strip()
-        token = item.get("token", "")
-        names = item.get("name", []) or []
-        desc = item.get("desc", "") or ""
-        old_tokens = item.get("old_tokens", []) or []
-        candidates = [token, *names, *old_tokens]
-        best_name = max((fuzz.WRatio(q, c.lower()) for c in candidates if c), default=0)
-        desc_score = fuzz.partial_ratio(q, desc.lower()) if desc else 0
-        prefix_bonus = 15 if any(c.lower().startswith(q) for c in candidates) else 0
-        exact_bonus = 20 if any(c.lower() == q for c in candidates) else 0
+        best_name = max((fuzz.WRatio(q, c) for c in candidates if c), default=0)
+        desc_score = fuzz.partial_ratio(q, desc) if desc else 0
+        prefix_bonus = 15 if any(c.startswith(q) for c in candidates) else 0
+        exact_bonus = 20 if any(c == q for c in candidates) else 0
         return best_name * 0.75 + desc_score * 0.25 + prefix_bonus + exact_bonus
 
     def search(self, query: str, limit: int = 15) -> List[SearchResult]:
+        q = query.lower().strip()
+        if not q:
+            return []
+        if not self._formula_search_items:
+            self._load_index("formula")
+        if not self._cask_search_items:
+            self._load_index("cask")
+
         results: List[SearchResult] = []
-        for item in self._load_index("formula"):
-            score = self._score_formula(item, query)
+        for item, candidates, desc in self._formula_search_items:
+            score = self._score_formula(candidates, desc, q)
             if score >= 45:
                 results.append(
                     SearchResult(
@@ -169,8 +223,8 @@ class Macbrew:
                         score,
                     )
                 )
-        for item in self._load_index("cask"):
-            score = self._score_cask(item, query)
+        for item, candidates, desc in self._cask_search_items:
+            score = self._score_cask(candidates, desc, q)
             if score >= 45:
                 display_name = ", ".join(item.get("name", [])[:2]) or item["token"]
                 results.append(
@@ -197,8 +251,10 @@ class Macbrew:
             return "HEAD"
 
     def _load_tap_items(self) -> List[Dict[str, Any]]:
+        if self._tap_items_cache is not None:
+            return self._tap_items_cache
         items: List[Dict[str, Any]] = []
-        for repo_root in TAPS_DIR.rglob(".git"):
+        for repo_root in sorted(TAPS_DIR.rglob(".git")):
             local = repo_root.parent
             try:
                 branch = self._tap_branch(local)
@@ -223,6 +279,7 @@ class Macbrew:
                         )
             except Exception:
                 continue
+        self._tap_items_cache = items
         return items
 
     def search_taps(self, query: str, limit: int = 20) -> List[SearchResult]:
@@ -305,21 +362,20 @@ class Macbrew:
                     return path, owner, repo, branch
         return None
 
-    def detail(self, kind: str, token: str, force: bool = False) -> Dict[str, Any]:
+    async def detail_async(self, kind: str, token: str, force: bool = False) -> Dict[str, Any]:
         tap_hit = self._tap_file_for_token(token, kind=kind)
         if tap_hit:
             path, owner, repo, branch = tap_hit
             rb_cache = self._detail_cache_file(kind, token)
             if not force and self._is_fresh(rb_cache):
-                rb = rb_cache.read_text()
+                rb = await asyncio.to_thread(rb_cache.read_text)
             else:
-                rb = path.read_text()
-                rb_cache.write_text(rb)
-            data = (
-                parse_formula_rb(rb)
-                if kind == "formula"
-                else parse_cask_rb(rb, arch_token=self._arch_placeholder())
-            )
+                rb = await asyncio.to_thread(path.read_text)
+                await asyncio.to_thread(rb_cache.write_text, rb)
+            if kind == "formula":
+                data = await asyncio.to_thread(parse_formula_rb, rb)
+            else:
+                data = await asyncio.to_thread(parse_cask_rb, rb, self._arch_placeholder())
             data["package_kind"] = kind
             return data
 
@@ -337,18 +393,20 @@ class Macbrew:
         rb_cache = self._detail_cache_file(kind, token)
 
         if not force and self._is_fresh(rb_cache):
-            rb = rb_cache.read_text()
+            rb = await asyncio.to_thread(rb_cache.read_text)
         else:
-            rb = self._fetch_text(self.session, raw_url)
-            rb_cache.write_text(rb)
+            rb = await self._fetch_text_async(raw_url)
+            await asyncio.to_thread(rb_cache.write_text, rb)
 
-        data = (
-            parse_formula_rb(rb)
-            if kind == "formula"
-            else parse_cask_rb(rb, arch_token=self._arch_placeholder())
-        )
+        if kind == "formula":
+            data = await asyncio.to_thread(parse_formula_rb, rb)
+        else:
+            data = await asyncio.to_thread(parse_cask_rb, rb, self._arch_placeholder())
         data["package_kind"] = kind
         return data
+
+    def detail(self, kind: str, token: str, force: bool = False) -> Dict[str, Any]:
+        return self._run(self.detail_async(kind, token, force))
 
     def choose_install_root(self, default_target: Optional[str] = None) -> Path:
         config_default = self.config.get("install_root", "/Applications")
@@ -372,24 +430,29 @@ class Macbrew:
                 selected.update(cask["arch_variants"].get("arm64", {}))
         return selected
 
-    def _download_file(self, url: str, expected_sha256: Optional[str]) -> Path:
+    async def _download_file_async(self, url: str, expected_sha256: Optional[str]) -> Path:
         filename = Path(urlparse(url).path).name or "download.bin"
         destination = DOWNLOAD_DIR / filename
         hasher = hashlib.sha256()
-        with self.session.get(url, stream=True, timeout=TIMEOUT) as response:
-            response.raise_for_status()
-            with destination.open("wb") as fh:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if not chunk:
-                        continue
-                    fh.write(chunk)
-                    hasher.update(chunk)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        async with self._get_client() as client:
+            async with client.stream("GET", url) as response:
+                response.raise_for_status()
+                with destination.open("wb") as fh:
+                    async for chunk in response.aiter_bytes(1024 * 1024):
+                        if not chunk:
+                            continue
+                        fh.write(chunk)
+                        hasher.update(chunk)
         if expected_sha256 and expected_sha256 != "no_check":
             actual = hasher.hexdigest()
             if actual.lower() != expected_sha256.lower():
-                destination.unlink(missing_ok=True)
+                await asyncio.to_thread(destination.unlink, missing_ok=True)
                 raise MacbrewError(f"SHA256 mismatch for {filename}")
         return destination
+
+    def _download_file(self, url: str, expected_sha256: Optional[str]) -> Path:
+        return self._run(self._download_file_async(url, expected_sha256))
 
     def _mount_dmg(self, dmg_path: Path) -> Path:
         mount_root = Path(tempfile.mkdtemp(prefix="macbrew-mount-"))
@@ -565,11 +628,12 @@ class Macbrew:
         downloaded = self._download_file(cask["url"], cask.get("sha256"))
         mount_root = extracted_root = None
         try:
-            source_root = self._mount_dmg(downloaded) if downloaded.suffix.lower() == ".dmg" else self._extract_if_needed(downloaded)
-            if downloaded.suffix.lower() != ".dmg":
-                extracted_root = source_root
-            else:
+            if downloaded.suffix.lower() == ".dmg":
+                source_root = self._mount_dmg(downloaded)
                 mount_root = source_root
+            else:
+                source_root = self._extract_if_needed(downloaded)
+                extracted_root = source_root
 
             app_source = next(source_root.rglob(app_name), None)
             if not app_source or not app_source.exists():
@@ -621,13 +685,17 @@ class Macbrew:
         self.uninstall_cask(token, zap=False)
         return self.install_cask(token)
 
-    def show(self, query: str) -> Dict[str, Any]:
+    async def show_async(self, query: str) -> Dict[str, Any]:
         kind, token = self.resolve(query)
-        return self.detail(kind, token)
+        return await self.detail_async(kind, token)
+
+    def show(self, query: str) -> Dict[str, Any]:
+        return self._run(self.show_async(query))
 
     def tap(self, value: str) -> Dict[str, Any]:
         local, url, owner, repo = ensure_tap_repo(value)
         branch = tap_branch(local)
+        self._tap_items_cache = None
         items: List[Dict[str, Any]] = []
         for top in ["Formula", "Casks"]:
             base = local / top
@@ -673,6 +741,7 @@ class Macbrew:
         if not local.exists():
             raise MacbrewError(f"Tap '{short}' is not installed.")
         shutil.rmtree(local)
+        self._tap_items_cache = None
         try:
             owner_dir = local.parent
             if owner_dir.exists() and not any(owner_dir.iterdir()):
@@ -954,7 +1023,7 @@ def cmd_info(app: Macbrew, args: argparse.Namespace) -> None:
 
 
 def cmd_refresh(app: Macbrew, args: argparse.Namespace) -> None:
-    app.refresh(force=args.force)
+    app._run(app.refresh(force=args.force))
     console.print("[bold green]✔ Cache refreshed.[/bold green]")
 
 
@@ -1066,7 +1135,7 @@ def main() -> int:
         }
         dispatch[args.command](app, args)
         return 0
-    except (requests.HTTPError, subprocess.CalledProcessError) as e:
+    except (httpx.HTTPError, subprocess.CalledProcessError) as e:
         console.print(f"[red]{e}[/red]", file=sys.stderr)
     except KeyboardInterrupt:
         console.print("Aborted.", file=sys.stderr)

@@ -1,0 +1,1 @@
+python -m zipapp . -o MacBrew.pyz -m "main:main"
