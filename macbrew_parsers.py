@@ -1,5 +1,7 @@
 import re
 from typing import Any, Dict, List, Optional
+import warnings
+warnings.filterwarnings("ignore", category=SyntaxWarning)
 
 CLASS_PATTERN = re.compile(r'^\s*class\s+([A-Za-z0-9_]+)\s+<\s+Formula', re.MULTILINE)
 DESC_PATTERN = re.compile(r'^\s*desc\s+"([^"]+)"', re.MULTILINE)
